@@ -36,6 +36,7 @@ var LibraryPThread = {
   $PThread__deps: ['_emscripten_thread_init',
                    '$terminateWorker',
                    '$cleanupThread',
+                   '$makePromise',
 #if MAIN_MODULE
                    '$markAsFinished',
 #endif
@@ -63,6 +64,7 @@ var LibraryPThread = {
     // the reverse mapping, each worker has a `pthread_ptr` when its running a
     // pthread.
     pthreads: {},
+    mainThreadMailboxShutdown: Promise.resolve(),
 #if ASSERTIONS
     nextWorkerID: 1,
     debugInit() {
@@ -92,6 +94,10 @@ var LibraryPThread = {
 #if ASSERTIONS
       PThread.debugInit();
 #endif
+      addOnInit(() => {
+        PThread.mainThreadMailboxShutdown = makePromise();
+        PThread.mainThreadMailboxShutdown.resolved = false;
+      });
       if ({{{ ENVIRONMENT_IS_MAIN_THREAD() }}}) {
         PThread.initMainThread();
       }
@@ -169,6 +175,8 @@ var LibraryPThread = {
       PThread.unusedWorkers = [];
       PThread.runningWorkers = [];
       PThread.pthreads = {};
+      PThread.mainThreadMailboxShutdown.resolve();
+      PThread.mainThreadMailboxShutdown.resolved = true;
     },
     returnWorkerToPool: (worker) => {
       // We don't want to run main thread queued calls here, since we are doing
@@ -1206,6 +1214,12 @@ var LibraryPThread = {
                         '_emscripten_check_mailbox',
                         '_emscripten_thread_mailbox_await'],
   $checkMailbox: () => {
+    // The main thread mailbox may be marked as shutdown when cleaning up
+    // after a module. This prevents leaking memory through a closure on
+    // a promise that will never finish. See #20920 for more context.
+    if ({{{ ENVIRONMENT_IS_MAIN_THREAD() }}} && PThread.mainThreadMailboxShutdown.resolved) {
+      return;
+    }
     // Only check the mailbox if we have a live pthread runtime. We implement
     // pthread_self to return 0 if there is no live runtime.
     var pthread_ptr = _pthread_self();
@@ -1230,7 +1244,17 @@ var LibraryPThread = {
 #if ASSERTIONS
       assert(wait.async);
 #endif
-      wait.value.then(checkMailbox);
+      // On cleanup, the last wait.value promise will be left unresolved.
+      // Anything that directly awaits it will be kept in memory, including any
+      // memory captured by closure. See #20920 for more context.
+      if ({{{ ENVIRONMENT_IS_MAIN_THREAD() }}}) {
+        Promise.race([
+          wait.value, // Typical case - the atomic for this pthread has been triggered
+          PThread.mainThreadMailboxShutdown.promise // Shutdown case
+        ]).then(checkMailbox);
+      } else {
+        wait.value.then(checkMailbox);
+      }
       var waitingAsync = pthread_ptr + {{{ C_STRUCTS.pthread.waiting_async }}};
       Atomics.store(HEAP32, {{{ getHeapOffset('waitingAsync', 'i32') }}}, 1);
     }
